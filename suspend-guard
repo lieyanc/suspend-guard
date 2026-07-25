@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# suspend-guard: 当 claude/codex 在干活(按进程树 CPU + 读写/网络流量判定,纯空闲挂着不算),
+# 或存在 RDP 连接时,持有 logind 抑制锁(block)阻止系统挂起。
+# 流量用 /proc/<pid>/io 的 rchar+wchar 增量做代理(含 socket 收发,无需 root),
+# 能抓到"低 CPU 但正在等 API 流式返回"的场景。
+# 参数可在 ~/.config/suspend-guard.conf 覆盖(shell 语法)。
+set -u
+
+[ -r "$HOME/.config/suspend-guard.conf" ] && . "$HOME/.config/suspend-guard.conf"
+
+: "${INTERVAL:=30}"               # 采样窗口(秒)
+: "${BUSY_CPU_SECS:=2}"           # 窗口内 agent 进程树 CPU 累计 ≥ 该秒数视为忙碌
+: "${BUSY_IO_KB:=200}"            # 窗口内 agent 进程树读写字节(含网络)≥ 该值(KB)视为忙碌
+: "${IDLE_WINDOWS_TO_RELEASE:=6}" # 连续空闲窗口达到此数才释放锁
+: "${AGENT_RE:=claude|codex}"     # 按进程名 comm 全词匹配,自动包含其全部后代进程
+: "${RDP_PORTS:=3389}"            # RDP 监听端口,空格分隔
+
+RUNDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+FORCE_FILE="$RUNDIR/suspend-guard.force"   # 存在即无条件保持唤醒(托盘"常亮"开关)
+STATE_FILE="$RUNDIR/suspend-guard.state"   # 供托盘读取:held|idle + 原因 + 指标
+
+CLK_TCK=$(getconf CLK_TCK)
+CPU_THRESH=$((BUSY_CPU_SECS * CLK_TCK))
+IO_THRESH=$((BUSY_IO_KB * 1024))
+
+declare -A prev_cpu prev_io
+inhibit_pid=""
+idle_windows=0
+CPU_DELTA=0
+IO_DELTA=0
+
+release() {
+  [ -z "$inhibit_pid" ] && return
+  pkill -TERM -P "$inhibit_pid" 2>/dev/null
+  kill -TERM "$inhibit_pid" 2>/dev/null
+  wait "$inhibit_pid" 2>/dev/null
+  inhibit_pid=""
+}
+trap 'release; rm -f "$STATE_FILE"; exit 0' TERM INT EXIT
+
+hold() {
+  if [ -n "$inhibit_pid" ] && kill -0 "$inhibit_pid" 2>/dev/null; then return; fi
+  systemd-inhibit --what=sleep:idle --mode=block \
+    --who="suspend-guard" --why="$1" sleep infinity &
+  inhibit_pid=$!
+  echo "acquire: $1"
+}
+
+rdp_active() {
+  local p
+  for p in $RDP_PORTS; do
+    [ -n "$(ss -Htn state established "( sport = :$p )" 2>/dev/null)" ] && return 0
+  done
+  return 1
+}
+
+# 统计 claude/codex 及其全部后代进程本窗口的 CPU(jiffies)与读写字节增量,
+# 写入 CPU_DELTA / IO_DELTA。cutime/cstime 一并计入,避免漏掉窗口内已退出的短命子进程。
+sample_agents() {
+  local pid ppid c stat cpu io k v roots
+  CPU_DELTA=0 IO_DELTA=0
+  declare -A child cur_cpu cur_io want
+  roots=$(pgrep -x "$AGENT_RE" || true)
+  if [ -n "$roots" ]; then
+    while read -r pid ppid; do
+      child[$ppid]+=" $pid"
+    done < <(ps -eo pid=,ppid=)
+    local -a queue
+    read -ra queue <<< "$(echo $roots)"
+    while [ "${#queue[@]}" -gt 0 ]; do
+      pid=${queue[0]}; queue=("${queue[@]:1}")
+      [ -n "${want[$pid]:-}" ] && continue
+      want[$pid]=1
+      for c in ${child[$pid]:-}; do queue+=("$c"); done
+    done
+    for pid in "${!want[@]}"; do
+      stat=$(cat "/proc/$pid/stat" 2>/dev/null) || continue
+      stat=${stat##*) }   # 去掉 "pid (comm) " 前缀,comm 可能含空格括号
+      set -- $stat        # 此后 utime/stime/cutime/cstime 为 $12 $13 $14 $15
+      cpu=$(( ${12} + ${13} + ${14} + ${15} ))
+      cur_cpu[$pid]=$cpu
+      CPU_DELTA=$(( CPU_DELTA + cpu - ${prev_cpu[$pid]:-$cpu} ))
+      io=0
+      while read -r k v; do
+        case $k in rchar:|wchar:) io=$((io + v));; esac
+      done < "/proc/$pid/io" 2>/dev/null || true
+      cur_io[$pid]=$io
+      IO_DELTA=$(( IO_DELTA + io - ${prev_io[$pid]:-$io} ))
+    done
+  fi
+  prev_cpu=(); prev_io=()
+  for pid in "${!cur_cpu[@]}"; do prev_cpu[$pid]=${cur_cpu[$pid]}; done
+  for pid in "${!cur_io[@]}"; do prev_io[$pid]=${cur_io[$pid]}; done
+}
+
+echo "started: interval=${INTERVAL}s, busy: cpu>=${BUSY_CPU_SECS}s or io>=${BUSY_IO_KB}KB per win, release after $((INTERVAL * IDLE_WINDOWS_TO_RELEASE))s idle, agents='${AGENT_RE}', rdp ports: ${RDP_PORTS}"
+sample_agents   # 首次采样只建立基线,不判定
+
+while :; do
+  sleep "$INTERVAL"
+  reason=""
+  [ -e "$FORCE_FILE" ] && reason="manual"
+  rdp_active && reason="${reason:+$reason + }RDP connected"
+  sample_agents
+  metrics="cpu=$((CPU_DELTA * 10 / CLK_TCK / 10)).$((CPU_DELTA * 10 / CLK_TCK % 10))s io=$((IO_DELTA / 1024))KB"
+  if [ "$CPU_DELTA" -ge "$CPU_THRESH" ] || [ "$IO_DELTA" -ge "$IO_THRESH" ]; then
+    reason="${reason:+$reason + }agent busy"
+  fi
+  if [ -n "$reason" ]; then
+    idle_windows=0
+    hold "$reason ($metrics)"
+    printf 'held|%s|%s\n' "$reason" "$metrics" > "$STATE_FILE"
+  else
+    if [ -n "$inhibit_pid" ]; then
+      idle_windows=$((idle_windows + 1))
+      if [ "$idle_windows" -ge "$IDLE_WINDOWS_TO_RELEASE" ]; then
+        echo "release: idle for $((idle_windows * INTERVAL))s"
+        release
+        idle_windows=0
+      fi
+    fi
+    if [ -n "$inhibit_pid" ]; then
+      printf 'held|cooling down %ss|%s\n' "$(( (IDLE_WINDOWS_TO_RELEASE - idle_windows) * INTERVAL ))" "$metrics" > "$STATE_FILE"
+    else
+      printf 'idle||%s\n' "$metrics" > "$STATE_FILE"
+    fi
+  fi
+done

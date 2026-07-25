@@ -1,0 +1,11 @@
+[Unit]
+Description=Block suspend while claude/codex is busy or RDP is connected
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/suspend-guard
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
