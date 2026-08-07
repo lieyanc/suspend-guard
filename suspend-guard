@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# suspend-guard: 当 claude/codex 在干活(以真实网络流量为主判定,纯空闲挂着不算),
+# suspend-guard: 当 claude/codex/opencode 在干活(以真实网络流量为主判定,纯空闲挂着不算),
 # 或存在 RDP 连接时,持有 logind 抑制锁(block)阻止系统挂起。
 # 网络流量按 agent 进程树名下每条 established TCP 连接的 bytes_sent+bytes_received
 # 增量统计(ss -ti,含回环,兼容本地代理场景,无需 root);CPU 仅作高阈值兜底,
@@ -13,7 +13,7 @@ set -u
 : "${BUSY_NET_KB:=5}"              # 窗口内 agent 进程树网络收发 ≥ 该值(KB)视为忙碌(主信号)
 : "${BUSY_CPU_SECS:=4}"            # 窗口内 agent 进程树 CPU ≥ 该秒数视为忙碌(兜底信号)
 : "${IDLE_WINDOWS_TO_RELEASE:=12}" # 连续空闲窗口达到此数才释放锁(12×15s=180s)
-: "${AGENT_RE:=claude|codex}"      # 按进程名 comm 全词匹配,自动包含其全部后代进程
+: "${AGENT_RE:=claude|codex|opencode}" # 按进程名 comm 全词匹配,自动包含其全部后代进程
 : "${RDP_PORTS:=3389}"             # RDP 监听端口,空格分隔
 
 RUNDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -55,7 +55,7 @@ rdp_active() {
   return 1
 }
 
-# 统计 claude/codex 及其全部后代进程本窗口的网络收发字节与 CPU(jiffies)增量,
+# 统计 agent(claude/codex/opencode)及其全部后代进程本窗口的网络收发字节与 CPU(jiffies)增量,
 # 写入 NET_DELTA / CPU_DELTA。cutime/cstime 一并计入,不漏窗口内退出的短命子进程。
 sample_agents() {
   local pid ppid c stat cpu roots line key rest owned l p s r total d

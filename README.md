@@ -1,8 +1,8 @@
 # suspend-guard
 
-在 **claude / codex 等 CLI agent 正在干活**(纯空闲不算)或**有 RDP 连接**时,阻止 Linux 桌面自动挂起;条件消失并冷却一段时间后,自动恢复允许挂起。附带一个 GNOME 托盘图标用于查看状态和开关。
+在 **claude / codex / opencode 等 CLI agent 正在干活**(纯空闲不算)或**有 RDP 连接**时,阻止 Linux 桌面自动挂起;条件消失并冷却一段时间后,自动恢复允许挂起。附带一个 GNOME 托盘图标用于查看状态和开关。
 
-写这个的动机:桌面开了"无操作自动挂起",但 RDP 挂着看东西、或者 claude code / codex 在后台跑长任务时,对系统来说都是"无操作",任务经常被挂起打断。
+写这个的动机:桌面开了"无操作自动挂起",但 RDP 挂着看东西、或者 claude code / codex / opencode 在后台跑长任务时,对系统来说都是"无操作",任务经常被挂起打断。
 
 ## 工作原理
 
@@ -10,7 +10,7 @@
 
 | 条件 | 判定方式 |
 | --- | --- |
-| agent 忙碌(主信号) | `claude` / `codex` 进程(comm 全词匹配)及其**全部后代**名下的 established TCP 连接,窗口内 `bytes_sent+bytes_received` 增量合计 ≥ 5KB(`ss -ti` 每连接统计) |
+| agent 忙碌(主信号) | `claude` / `codex` / `opencode` 进程(comm 全词匹配)及其**全部后代**名下的 established TCP 连接,窗口内 `bytes_sent+bytes_received` 增量合计 ≥ 5KB(`ss -ti` 每连接统计) |
 | agent 忙碌(兜底) | 同一进程树窗口内 CPU 累计 ≥ 4s,覆盖编译/测试等没有网络的纯本地重活 |
 | RDP 连接 | RDP 端口(默认 3389)存在 established TCP 连接 |
 | 手动常亮 | 存在 `$XDG_RUNTIME_DIR/suspend-guard.force`(托盘"常亮"开关) |
@@ -18,7 +18,7 @@
 细节:
 
 - **以真实网络流量为主**:agent 干活的本质是和 API 有来往流量。按连接统计真实字节(tcp_info),不用 rchar/wchar 这类含 tty 重绘、磁盘读写的粗代理——后者噪声大到空闲 agent 也会被误判忙碌,导致锁一直不放。
-- **纯空闲不触发**:实测挂在提示符的 claude/codex 进程树为 0KB 网络 / ~0.03s CPU 每窗口,与阈值有两个数量级的间隔。
+- **纯空闲不触发**:实测挂在提示符的 claude/codex/opencode 进程树为 0KB 网络 / ~0.03s CPU 每窗口,与阈值有两个数量级的间隔。
 - **回环流量也计入**:API 走本地代理(clash/mitmproxy 等)时流量对端是 127.0.0.1,照样统计。
 - **cutime/cstime 计入 CPU**,窗口内已退出的短命子进程(如编译器)不漏算。
 - **冷却释放**:条件消失后需连续空闲 12 个窗口(180s)才放锁,容忍请求间隙和长思考静默。
@@ -66,7 +66,7 @@ cd suspend-guard
 | `BUSY_NET_KB` | `5` | 窗口内进程树网络收发 ≥ 该值(KB)视为忙碌(主信号) |
 | `BUSY_CPU_SECS` | `4` | 窗口内进程树 CPU ≥ 该秒数视为忙碌(兜底信号) |
 | `IDLE_WINDOWS_TO_RELEASE` | `12` | 连续空闲窗口数,达到才释放锁(12×15s=180s) |
-| `AGENT_RE` | `claude\|codex` | 进程名 ERE,comm 全词匹配 |
+| `AGENT_RE` | `claude\|codex\|opencode` | 进程名 ERE,comm 全词匹配 |
 | `RDP_PORTS` | `3389` | RDP 端口,空格分隔 |
 
 ## 查看状态 / 排错

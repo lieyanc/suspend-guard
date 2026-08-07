@@ -1,5 +1,5 @@
 [Unit]
-Description=Block suspend while claude/codex is busy or RDP is connected
+Description=Block suspend while claude/codex/opencode is busy or RDP is connected
 
 [Service]
 Type=exec
