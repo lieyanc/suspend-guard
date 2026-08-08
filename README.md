@@ -10,15 +10,16 @@
 
 | 条件 | 判定方式 |
 | --- | --- |
-| agent 忙碌(主信号) | `claude` / `codex` / `opencode` 进程(comm 全词匹配)及其**全部后代**名下的 established TCP 连接,窗口内 `bytes_sent+bytes_received` 增量合计 ≥ 5KB(`ss -ti` 每连接统计) |
-| agent 忙碌(兜底) | 同一进程树窗口内 CPU 累计 ≥ 4s,覆盖编译/测试等没有网络的纯本地重活 |
+| agent 忙碌(主信号) | 任一 `claude` / `codex` / `opencode` 根进程(comm 全词匹配)及其**全部后代**名下的 established TCP 连接,窗口内 `bytes_sent+bytes_received` 增量合计 ≥ 5KB(`ss -ti` 每连接统计) |
+| agent 忙碌(兜底) | 任一独立进程树窗口内 CPU 累计 ≥ 4s,覆盖编译/测试等没有网络的纯本地重活 |
 | RDP 连接 | RDP 端口(默认 3389)存在 established TCP 连接 |
 | 手动常亮 | 存在 `$XDG_RUNTIME_DIR/suspend-guard.force`(托盘"常亮"开关) |
 
 细节:
 
 - **以真实网络流量为主**:agent 干活的本质是和 API 有来往流量。按连接统计真实字节(tcp_info),不用 rchar/wchar 这类含 tty 重绘、磁盘读写的粗代理——后者噪声大到空闲 agent 也会被误判忙碌,导致锁一直不放。
-- **纯空闲不触发**:实测挂在提示符的 claude/codex/opencode 进程树为 0KB 网络 / ~0.03s CPU 每窗口,与阈值有两个数量级的间隔。
+- **纯空闲不触发**:挂在提示符的 agent 即使有少量 TUI 后台 CPU,只要单棵进程树未达到阈值就不会触发。
+- **会话间不累加**:每个 agent 根进程树独立比较阈值,避免同时挂着多个空闲 TUI 时,后台 CPU 或心跳流量合计后误判忙碌。
 - **回环流量也计入**:API 走本地代理(clash/mitmproxy 等)时流量对端是 127.0.0.1,照样统计。
 - **cutime/cstime 计入 CPU**,窗口内已退出的短命子进程(如编译器)不漏算。
 - **冷却释放**:条件消失后需连续空闲 12 个窗口(180s)才放锁,容忍请求间隙和长思考静默。
@@ -50,7 +51,7 @@ cd suspend-guard
 
 ## 托盘
 
-- 🔒 `changes-prevent`:正在阻止挂起(菜单里能看到原因和当窗口 net/CPU 数值)
+- 🔒 `changes-prevent`:正在阻止挂起(菜单里能看到原因和当窗口单进程树 net/CPU 峰值)
 - 🔓 `changes-allow`:空闲,允许挂起
 - ⊘ `action-unavailable`:守护服务未运行
 
@@ -63,8 +64,8 @@ cd suspend-guard
 | 变量 | 默认 | 含义 |
 | --- | --- | --- |
 | `INTERVAL` | `15` | 采样窗口(秒) |
-| `BUSY_NET_KB` | `5` | 窗口内进程树网络收发 ≥ 该值(KB)视为忙碌(主信号) |
-| `BUSY_CPU_SECS` | `4` | 窗口内进程树 CPU ≥ 该秒数视为忙碌(兜底信号) |
+| `BUSY_NET_KB` | `5` | 任一独立进程树窗口内网络收发 ≥ 该值(KB)视为忙碌(主信号) |
+| `BUSY_CPU_SECS` | `4` | 任一独立进程树窗口内 CPU ≥ 该秒数视为忙碌(兜底信号) |
 | `IDLE_WINDOWS_TO_RELEASE` | `12` | 连续空闲窗口数,达到才释放锁(12×15s=180s) |
 | `AGENT_RE` | `claude\|codex\|opencode` | 进程名 ERE,comm 全词匹配 |
 | `RDP_PORTS` | `3389` | RDP 端口,空格分隔 |
