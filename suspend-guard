@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # suspend-guard: 当 claude/codex/opencode 在干活(以真实网络流量为主判定,纯空闲挂着不算),
-# 或存在 RDP 连接时,持有 logind 抑制锁(block)阻止系统挂起。
+# 或存在 RDP 连接、或 ComfyUI 这类"在跑就别挂起"的进程存在时,
+# 持有 logind 抑制锁(block)阻止系统挂起。
 # 网络流量按 agent 进程树名下每条 established TCP 连接的 bytes_sent+bytes_received
 # 增量统计(ss -ti,含回环,兼容本地代理场景,无需 root);CPU 仅作高阈值兜底,
 # 用于编译/测试等无网络的纯本地重活。
@@ -15,6 +16,8 @@ set -u
 : "${IDLE_WINDOWS_TO_RELEASE:=12}" # 连续空闲窗口达到此数才释放锁(12×15s=180s)
 : "${AGENT_RE:=claude|codex|opencode}" # 按进程名 comm 全词匹配,自动包含其全部后代进程
 : "${RDP_PORTS:=3389}"             # RDP 监听端口,空格分隔
+: "${KEEPALIVE_PROC_RE=ComfyUI.*main\.py}"  # 该 ERE 匹配到进程即无条件保持唤醒(不做忙闲判定);置空关闭
+: "${KEEPALIVE_PROC_LABEL:=ComfyUI}"        # 命中时日志/托盘里显示的名字
 
 RUNDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 FORCE_FILE="$RUNDIR/suspend-guard.force"   # 存在即无条件保持唤醒(托盘"常亮"开关)
@@ -52,6 +55,36 @@ rdp_active() {
   local p
   for p in $RDP_PORTS; do
     [ -n "$(ss -Htn state established "( sport = :$p )" 2>/dev/null)" ] && return 0
+  done
+  return 1
+}
+
+# 只看"在不在跑"的进程(默认 ComfyUI 服务):GPU 出图期间进程的网络和 CPU 都可能很低,
+# 阈值判定看不出忙碌,所以这类程序一存在就保持唤醒。
+# 匹配串是每个进程的「exe 路径 + 工作目录 + 完整命令行」拼接,因此 `cd ~/ComfyUI &&
+# .venv/bin/python main.py` 这种命令行里不含 ComfyUI 的启动方式也能命中;默认模式要求
+# 目录名与 main.py 同时出现,只把终端 cd 进该目录不算在跑。他人进程读不到 exe/cwd,
+# 退化为只按命令行匹配。
+keepalive_proc() {
+  [ -z "$KEEPALIVE_PROC_RE" ] && return 1
+  local line pid target f cmd
+  local -A links
+  local -a argv
+  # 一次 ls 取回全部进程的 exe/cwd 链接目标,避免每个进程 fork 一次 readlink
+  while IFS= read -r line; do
+    [[ $line == *" -> "* ]] || continue
+    target=${line#* -> }
+    pid=${line% -> *}; pid=${pid##* }   # /proc/<pid>/exe 或 /proc/<pid>/cwd
+    pid=${pid#/proc/}; pid=${pid%/*}
+    links[$pid]="${links[$pid]:-} $target"
+  done < <(ls -l /proc/[0-9]*/exe /proc/[0-9]*/cwd 2>/dev/null)
+  for f in /proc/[0-9]*/cmdline; do
+    pid=${f#/proc/}; pid=${pid%/*}
+    [ "$pid" = "$$" ] && continue
+    mapfile -d '' -t argv 2>/dev/null < "$f" || continue
+    cmd="${argv[*]}"
+    [ -z "$cmd" ] && continue           # 内核线程
+    [[ "${links[$pid]:-} $cmd" =~ $KEEPALIVE_PROC_RE ]] && return 0
   done
   return 1
 }
@@ -141,7 +174,15 @@ sample_agents() {
   for key in "${!cur_net[@]}"; do prev_net[$key]=${cur_net[$key]}; done
 }
 
-echo "started: interval=${INTERVAL}s, busy per agent tree: net>=${BUSY_NET_KB}KB (primary) or cpu>=${BUSY_CPU_SECS}s (fallback) per win, release after $((INTERVAL * IDLE_WINDOWS_TO_RELEASE))s idle, agents='${AGENT_RE}', rdp ports: ${RDP_PORTS}"
+if [ -n "$KEEPALIVE_PROC_RE" ]; then   # 配置里正则写错会在每个进程上报错刷屏,启动时先验一次
+  [[ "" =~ $KEEPALIVE_PROC_RE ]]
+  if [ "$?" -gt 1 ]; then
+    echo "warning: KEEPALIVE_PROC_RE 不是合法 ERE,已关闭该项" >&2
+    KEEPALIVE_PROC_RE=""
+  fi
+fi
+
+echo "started: interval=${INTERVAL}s, busy per agent tree: net>=${BUSY_NET_KB}KB (primary) or cpu>=${BUSY_CPU_SECS}s (fallback) per win, release after $((INTERVAL * IDLE_WINDOWS_TO_RELEASE))s idle, agents='${AGENT_RE}', rdp ports: ${RDP_PORTS}, keepalive proc: '${KEEPALIVE_PROC_RE:-disabled}'"
 sample_agents   # 首次采样只建立基线,不判定
 
 while :; do
@@ -149,6 +190,7 @@ while :; do
   reason=""
   [ -e "$FORCE_FILE" ] && reason="manual"
   rdp_active && reason="${reason:+$reason + }RDP connected"
+  keepalive_proc && reason="${reason:+$reason + }${KEEPALIVE_PROC_LABEL} running"
   sample_agents
   metrics="net=$((MAX_NET_DELTA / 1024))KB cpu=$((MAX_CPU_DELTA * 10 / CLK_TCK / 10)).$((MAX_CPU_DELTA * 10 / CLK_TCK % 10))s"
   if [ "$AGENT_BUSY" = 1 ]; then

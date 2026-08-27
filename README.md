@@ -1,6 +1,6 @@
 # suspend-guard
 
-在 **claude / codex / opencode 等 CLI agent 正在干活**(纯空闲不算)或**有 RDP 连接**时,阻止 Linux 桌面自动挂起;条件消失并冷却一段时间后,自动恢复允许挂起。附带一个 GNOME 托盘图标用于查看状态和开关。
+在 **claude / codex / opencode 等 CLI agent 正在干活**(纯空闲不算)、**ComfyUI 在跑**或**有 RDP 连接**时,阻止 Linux 桌面自动挂起;条件消失并冷却一段时间后,自动恢复允许挂起。附带一个 GNOME 托盘图标用于查看状态和开关。
 
 写这个的动机:桌面开了"无操作自动挂起",但 RDP 挂着看东西、或者 claude code / codex / opencode 在后台跑长任务时,对系统来说都是"无操作",任务经常被挂起打断。
 
@@ -12,6 +12,7 @@
 | --- | --- |
 | agent 忙碌(主信号) | 任一 `claude` / `codex` / `opencode` 根进程(comm 全词匹配)及其**全部后代**名下的 established TCP 连接,窗口内 `bytes_sent+bytes_received` 增量合计 ≥ 5KB(`ss -ti` 每连接统计) |
 | agent 忙碌(兜底) | 任一独立进程树窗口内 CPU 累计 ≥ 4s,覆盖编译/测试等没有网络的纯本地重活 |
+| 指定进程在跑 | 存在匹配 `KEEPALIVE_PROC_RE`(默认 `ComfyUI.*main\.py`)的进程,**不做忙闲判定,在跑就保持唤醒** |
 | RDP 连接 | RDP 端口(默认 3389)存在 established TCP 连接 |
 | 手动常亮 | 存在 `$XDG_RUNTIME_DIR/suspend-guard.force`(托盘"常亮"开关) |
 
@@ -22,6 +23,7 @@
 - **会话间不累加**:每个 agent 根进程树独立比较阈值,避免同时挂着多个空闲 TUI 时,后台 CPU 或心跳流量合计后误判忙碌。
 - **回环流量也计入**:API 走本地代理(clash/mitmproxy 等)时流量对端是 127.0.0.1,照样统计。
 - **cutime/cstime 计入 CPU**,窗口内已退出的短命子进程(如编译器)不漏算。
+- **ComfyUI 这类程序只看在不在跑**:出图时活儿在 GPU 上,进程的网络和 CPU 都可能很低,阈值判定看不出忙碌,所以对它不做忙闲判定。匹配串是每个进程的「exe 路径 + 工作目录 + 完整命令行」拼接,所以 `cd ~/ComfyUI && .venv/bin/python main.py` 这种命令行里根本不含 `ComfyUI` 的启动方式也能命中;默认模式要求目录名和 `main.py` 同时出现,只把终端 `cd` 进该目录不会被算作在跑。
 - **冷却释放**:条件消失后需连续空闲 12 个窗口(180s)才放锁,容忍请求间隙和长思考静默。
 - **全程无需 root**:活动图形会话下,用户服务就能拿到 logind 的 block 锁(polkit `allow_active`);`ss -tip` 看本用户进程的连接也不需要特权。
 
@@ -69,6 +71,18 @@ cd suspend-guard
 | `IDLE_WINDOWS_TO_RELEASE` | `12` | 连续空闲窗口数,达到才释放锁(12×15s=180s) |
 | `AGENT_RE` | `claude\|codex\|opencode` | 进程名 ERE,comm 全词匹配 |
 | `RDP_PORTS` | `3389` | RDP 端口,空格分隔 |
+| `KEEPALIVE_PROC_RE` | `ComfyUI.*main\.py` | 匹配到就无条件保持唤醒的进程 ERE(匹配「exe + cwd + 命令行」拼串);**置空即关闭该功能** |
+| `KEEPALIVE_PROC_LABEL` | `ComfyUI` | 命中时日志/托盘里显示的名字 |
+
+例:ComfyUI 装在别处、或想换成别的程序(如 stable-diffusion-webui、训练脚本):
+
+```bash
+# ~/.config/suspend-guard.conf
+KEEPALIVE_PROC_RE='ComfyUI.*main\.py|stable-diffusion-webui.*launch\.py'
+KEEPALIVE_PROC_LABEL='GPU job'
+# 不需要这个功能:
+# KEEPALIVE_PROC_RE=''
+```
 
 ## 查看状态 / 排错
 
@@ -87,6 +101,8 @@ cat "$XDG_RUNTIME_DIR/suspend-guard.state"       # held|原因|指标(托盘数�
 ## 已知局限
 
 - 网络按 **连接快照的增量** 统计:窗口内建立又关闭的短命连接不计入。agent 对 API 用的是长连接,不受影响;极端情况下密集短连接的流量会被低估,可靠 CPU 兜底补偿。
+- `KEEPALIVE_PROC_RE` 命中的程序**只看在不在跑**:ComfyUI 服务开着不关,机器就一直不会自动挂起——这正是这条规则的用意。想让服务常驻又能自动挂起,把该项置空,出图前用托盘"常亮"手动兜一下。
+- 该项按「exe + cwd + 命令行」匹配,所以像 `nvim ~/ComfyUI/main.py` 这种命令行里带上了目录和文件名的进程也会被算作命中;要更严格可把模式收窄到你的启动器路径。
 - agent 处于**纯静默等待**(零流量、近零 CPU,比如 `sleep 600` 式工具调用,或模型长思考期间心跳恰好极小)超过冷却时长会被视为空闲;桌面端通常还有几十分钟的"无操作"阈值兜着,实际很难恰好撞上。
 - 持锁期间手动挂起也会被拦;确要挂起用 `systemctl suspend -i`。
 - 只管登录后的用户会话;GDM 登录界面自己的自动挂起不归它管。
